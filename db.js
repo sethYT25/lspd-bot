@@ -3,8 +3,7 @@ const mongoose = require('mongoose');
 // ─── CONEXIÓN ─────────────────────────────────────────────────────────────────
 async function connectDB() {
   await mongoose.connect(process.env.MONGODB_URI, {
-    tls: true,
-    tlsAllowInvalidCertificates: true,
+    tls: false,
     serverSelectionTimeoutMS: 10000,
   });
   console.log('MongoDB conectado.');
