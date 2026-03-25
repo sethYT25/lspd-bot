@@ -5,7 +5,7 @@ const {
   ModalBuilder, TextInputBuilder, TextInputStyle,
   SlashCommandBuilder, REST, Routes
 } = require('discord.js');
-const fs = require('fs');
+const { connectDB, Session, History, Sancion, Pending } = require('./db');
 
 const client = new Client({
   intents: [
@@ -33,22 +33,62 @@ const RANGOS = [
 ];
 
 const INACTIVIDAD_DIAS = 5;
-const MAX_TURNO_MS = 30 * 60 * 1000; // 30 minutos
+const MAX_TURNO_MS = 30 * 60 * 1000;
 
-const DATA_FILE = './data.json';
-
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ sessions: {}, history: {}, pendingBitacora: {}, sanciones: {} }));
-  }
-  const data = JSON.parse(fs.readFileSync(DATA_FILE));
-  if (!data.pendingBitacora) data.pendingBitacora = {};
-  if (!data.sanciones) data.sanciones = {};
-  return data;
+// ─── HELPERS DB ──────────────────────────────────────────────────────────────
+async function getSession(userId) {
+  return await Session.findOne({ userId });
 }
-
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+async function setSession(userId, username, start) {
+  await Session.findOneAndUpdate({ userId }, { userId, username, start }, { upsert: true });
+}
+async function deleteSession(userId) {
+  await Session.deleteOne({ userId });
+}
+async function getAllSessions() {
+  const sessions = await Session.find();
+  const obj = {};
+  sessions.forEach(s => { obj[s.userId] = { start: s.start, username: s.username }; });
+  return obj;
+}
+async function getHistory(userId) {
+  return await History.findOne({ userId });
+}
+async function addSessionToHistory(userId, username, start, end, duration) {
+  await History.findOneAndUpdate(
+    { userId },
+    { $inc: { totalMs: duration }, $push: { sessions: { start, end, duration } }, $set: { username } },
+    { upsert: true }
+  );
+}
+async function getAllHistory() {
+  return await History.find();
+}
+async function resetAllHistory() {
+  await History.deleteMany({});
+  await Session.deleteMany({});
+}
+async function getSanciones(userId) {
+  const doc = await Sancion.findOne({ userId });
+  return doc ? doc.sanciones : [];
+}
+async function addSancion(userId, motivo, fecha, por) {
+  await Sancion.findOneAndUpdate(
+    { userId },
+    { $push: { sanciones: { motivo, fecha, por } } },
+    { upsert: true }
+  );
+  const doc = await Sancion.findOne({ userId });
+  return doc.sanciones.length;
+}
+async function getPending(userId) {
+  return await Pending.findOne({ userId });
+}
+async function setPending(userId, channelId, messageId) {
+  await Pending.findOneAndUpdate({ userId }, { userId, channelId, messageId }, { upsert: true });
+}
+async function deletePending(userId) {
+  await Pending.deleteOne({ userId });
 }
 
 function formatDuration(ms) {
@@ -136,23 +176,18 @@ async function sendBitacoraMessage(channel) {
 }
 
 async function updateActivosMessage() {
-  const data = loadData();
+  const sessions = await getAllSessions();
   const activosChannel = await client.channels.fetch(process.env.ACTIVOS_CHANNEL_ID).catch((e) => {
     console.error('Error fetching activos channel:', e.message);
     return null;
   });
   if (!activosChannel) return;
 
-  const sessions = data.sessions;
-  const now = Date.now();
   let descripcion = '';
-
   if (Object.keys(sessions).length === 0) {
     descripcion = '*No hay oficiales en servicio actualmente.*';
   } else {
-    descripcion = Object.entries(sessions).map(([uid]) => {
-      return `🟢 <@${uid}> — en servicio`;
-    }).join('\n');
+    descripcion = Object.entries(sessions).map(([uid]) => `🟢 <@${uid}> — en servicio`).join('\n');
   }
 
   const embed = new EmbedBuilder()
@@ -403,6 +438,7 @@ async function sendOperativaMessage(channel) {
 
 // ─── READY ────────────────────────────────────────────────────────────────────
 client.once('clientReady', async () => {
+  await connectDB();
   console.log(`Bot conectado como ${client.user.tag}`);
 
   const guild = client.guilds.cache.first();
@@ -499,42 +535,34 @@ client.once('clientReady', async () => {
 
 // ─── RESETEO SEMANAL ─────────────────────────────────────────────────────────
 async function resetearHorasSemanal() {
-  const data = loadData();
   const resetChannel = await client.channels.fetch(process.env.RESET_CHANNEL_ID).catch(() => null);
-
   if (resetChannel) {
-    const lines = Object.values(data.history)
+    const history = await getAllHistory();
+    const lines = history
       .sort((a, b) => b.totalMs - a.totalMs)
       .map((u, i) => `${i + 1}. **${u.username}** — ${formatDuration(u.totalMs)}`)
       .join('\n');
-
     const embed = new EmbedBuilder()
       .setTitle('📊 Resumen Semanal – LSPD')
       .setDescription(lines || 'Sin registros esta semana.')
       .setColor(0xffd700)
       .setFooter({ text: 'Las horas han sido reseteadas para la nueva semana.' })
       .setTimestamp();
-
     await resetChannel.send({ embeds: [embed] });
   }
-
-  data.history = {};
-  data.sessions = {};
-  saveData(data);
+  await resetAllHistory();
   console.log('Horas reseteadas automáticamente.');
 }
 
 // ─── CHEQUEO TURNOS LARGOS ────────────────────────────────────────────────────
 async function checkTurnosLargos() {
-  const data = loadData();
+  const sessions = await getAllSessions();
   const now = Date.now();
-  for (const [userId, session] of Object.entries(data.sessions)) {
+  for (const [userId, session] of Object.entries(sessions)) {
     if (now - session.start > MAX_TURNO_MS) {
       const inactividadChannel = await client.channels.fetch(process.env.INACTIVIDAD_CHANNEL_ID).catch(() => null);
       if (inactividadChannel) {
-        await inactividadChannel.send({
-          content: `⚠️ <@${userId}> lleva más de 30 minutos con el turno abierto sin cerrarlo. Staff o Alto Mando puede cerrarlo con \`/cerrar_turno\`.`
-        });
+        await inactividadChannel.send(`⚠️ <@${userId}> lleva más de 30 minutos con el turno abierto sin cerrarlo. Staff o Alto Mando puede cerrarlo con \`/cerrar_turno\`.`);
       }
     }
   }
@@ -542,22 +570,18 @@ async function checkTurnosLargos() {
 
 // ─── CHEQUEO INACTIVIDAD ──────────────────────────────────────────────────────
 async function checkInactividad() {
-  const data = loadData();
   const now = Date.now();
   const guild = client.guilds.cache.first();
   if (!guild) return;
-
   const inactividadChannel = await client.channels.fetch(process.env.INACTIVIDAD_CHANNEL_ID).catch(() => null);
   if (!inactividadChannel) return;
-
-  for (const [userId, userHistory] of Object.entries(data.history)) {
+  const history = await getAllHistory();
+  for (const userHistory of history) {
     const lastSession = userHistory.sessions[userHistory.sessions.length - 1];
     if (!lastSession) continue;
     const diasSinTurno = (now - lastSession.end) / (1000 * 60 * 60 * 24);
     if (diasSinTurno >= INACTIVIDAD_DIAS) {
-      await inactividadChannel.send({
-        content: `📋 <@${userId}> lleva **${Math.floor(diasSinTurno)} días** sin registrar turno. Revisar situación de actividad.`
-      });
+      await inactividadChannel.send({ content: `📋 <@${userHistory.userId}> lleva **${Math.floor(diasSinTurno)} días** sin registrar turno. Revisar situación de actividad.` });
     }
   }
 }
@@ -618,7 +642,6 @@ client.on('guildMemberAdd', async (member) => {
 
 // ─── SLASH COMMANDS ───────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
-  const data = loadData();
 
   if (interaction.isChatInputCommand()) {
     const isStaff = interaction.member.roles.cache.has(process.env.STAFF_ROLE_ID);
@@ -651,8 +674,8 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'ficha') {
       const target = interaction.options.getMember('oficial') || interaction.member;
       const rangoActual = getRangoActual(target);
-      const userHistory = data.history[target.id];
-      const sanciones = data.sanciones[target.id] || [];
+      const userHistory = await getHistory(target.id);
+      const sanciones = await getSanciones(target.id);
       const embed = new EmbedBuilder()
         .setTitle(`📁 Ficha Oficial – ${target.user.tag}`)
         .setColor(0x1e90ff)
@@ -672,17 +695,10 @@ client.on('interactionCreate', async (interaction) => {
       if (!isStaff) return interaction.reply({ content: '❌ Solo Comandancia puede sancionar oficiales.', ephemeral: true });
       const target = interaction.options.getMember('oficial');
       const motivo = interaction.options.getString('motivo');
-      if (!data.sanciones[target.id]) data.sanciones[target.id] = [];
-      data.sanciones[target.id].push({ motivo, fecha: Date.now(), por: interaction.user.tag });
-      saveData(data);
-      const total = data.sanciones[target.id].length;
-
-      // Avisar al staff si llega a 3 sanciones
+      const total = await addSancion(target.id, motivo, Date.now(), interaction.user.tag);
       if (total >= 3) {
         const inactividadChannel = await client.channels.fetch(process.env.INACTIVIDAD_CHANNEL_ID).catch(() => null);
-        if (inactividadChannel) {
-          await inactividadChannel.send(`⚠️ <@&${process.env.STAFF_ROLE_ID}> El oficial <@${target.id}> ha acumulado **${total} sanciones**. Se recomienda revisar su situación.`);
-        }
+        if (inactividadChannel) await inactividadChannel.send(`⚠️ <@&${process.env.STAFF_ROLE_ID}> El oficial <@${target.id}> ha acumulado **${total} sanciones**. Se recomienda revisar su situación.`);
       }
       const embed = new EmbedBuilder()
         .setTitle('⚠️ Sanción Aplicada – LSPD')
@@ -702,8 +718,8 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'buscar') {
       if (!isStaff) return interaction.reply({ content: '❌ Solo Comandancia puede usar este comando.', ephemeral: true });
       const target = interaction.options.getMember('oficial');
-      const userHistory = data.history[target.id];
-      const sanciones = data.sanciones[target.id] || [];
+      const userHistory = await getHistory(target.id);
+      const sanciones = await getSanciones(target.id);
       const rangoActual = getRangoActual(target);
       const ultimosTurnos = userHistory?.sessions.slice(-5).reverse().map(s =>
         `• ${new Date(s.start).toLocaleDateString('es-CL')} — ${formatDuration(s.duration)}`
@@ -728,9 +744,7 @@ client.on('interactionCreate', async (interaction) => {
     // /resetear_horas
     if (interaction.commandName === 'resetear_horas') {
       if (!isStaff) return interaction.reply({ content: '❌ Solo Comandancia puede resetear horas.', ephemeral: true });
-      data.history = {};
-      data.sessions = {};
-      saveData(data);
+      await resetAllHistory();
       return interaction.reply({ content: '✅ Horas de todos los oficiales reseteadas.', ephemeral: true });
     }
 
@@ -810,14 +824,15 @@ client.on('interactionCreate', async (interaction) => {
         const count = guild.members.cache.filter(m => m.roles.cache.has(r.id)).size;
         return count > 0 ? `${r.nombre}: **${count}**` : null;
       }).filter(Boolean).join('\n');
-      const totalHoras = Object.values(data.history).reduce((acc, u) => acc + u.totalMs, 0);
+      const allHistory = await getAllHistory();
+      const totalHoras = allHistory.reduce((acc, u) => acc + u.totalMs, 0);
       const embed = new EmbedBuilder()
         .setTitle('📊 Estadísticas – LSPD UnderGroundRP')
         .setColor(0x1e90ff)
         .addFields(
           { name: '👮 Oficiales por Rango', value: porRango || 'Sin datos' },
           { name: '⏱️ Horas Totales Acumuladas', value: formatDuration(totalHoras) },
-          { name: '📋 Turnos Registrados', value: `${Object.values(data.history).reduce((acc, u) => acc + u.sessions.length, 0)}` },
+          { name: '📋 Turnos Registrados', value: `${allHistory.reduce((acc, u) => acc + u.sessions.length, 0)}` },
         )
         .setTimestamp();
       return interaction.reply({ embeds: [embed] });
@@ -834,14 +849,11 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'cerrar_turno') {
       if (!isStaff) return interaction.reply({ content: '❌ Solo Comandancia o Alto Mando puede cerrar turnos.', ephemeral: true });
       const target = interaction.options.getMember('oficial');
-      const session = data.sessions[target.id];
+      const session = await getSession(target.id);
       if (!session) return interaction.reply({ content: '⚠️ Este oficial no tiene un turno activo.', ephemeral: true });
       const duration = Date.now() - session.start;
-      if (!data.history[target.id]) data.history[target.id] = { username: target.user.tag, totalMs: 0, sessions: [] };
-      data.history[target.id].totalMs += duration;
-      data.history[target.id].sessions.push({ start: session.start, end: Date.now(), duration });
-      delete data.sessions[target.id];
-      saveData(data);
+      await addSessionToHistory(target.id, target.user.tag, session.start, Date.now(), duration);
+      await deleteSession(target.id);
       await interaction.reply({ content: `✅ Turno de <@${target.id}> cerrado. Duración: **${formatDuration(duration)}**` });
       try { await target.send(`🔴 Tu turno fue cerrado por Comandancia. Duración: **${formatDuration(duration)}**`); } catch {}
     }
@@ -853,10 +865,9 @@ client.on('interactionCreate', async (interaction) => {
     const now = Date.now();
 
     if (interaction.customId === 'iniciar_turno') {
-      if (data.sessions[userId]) return interaction.reply({ content: '⚠️ Ya tienes un turno activo.', ephemeral: true });
-      data.sessions[userId] = { start: now, username: interaction.user.tag };
-      saveData(data);
-      // Radio automática
+      const existing = await getSession(userId);
+      if (existing) return interaction.reply({ content: '⚠️ Ya tienes un turno activo.', ephemeral: true });
+      await setSession(userId, interaction.user.tag, now);
       const radioChannel = await client.channels.fetch(process.env.RADIO_CHANNEL_ID).catch(() => null);
       if (radioChannel) await radioChannel.send(`🟢 **${interaction.member.nickname || interaction.user.username}** ha iniciado servicio. <t:${Math.floor(now/1000)}:T>`);
       updateActivosMessage();
@@ -864,30 +875,20 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.customId === 'finalizar_turno') {
-      const session = data.sessions[userId];
+      const session = await getSession(userId);
       if (!session) return interaction.reply({ content: '⚠️ No tienes un turno activo.', ephemeral: true });
       const duration = now - session.start;
-      if (!data.history[userId]) data.history[userId] = { username: interaction.user.tag, totalMs: 0, sessions: [] };
-      data.history[userId].totalMs += duration;
-      data.history[userId].sessions.push({ start: session.start, end: now, duration });
-      delete data.sessions[userId];
-      saveData(data);
-      // Radio automática
+      await addSessionToHistory(userId, interaction.user.tag, session.start, now, duration);
+      await deleteSession(userId);
       const radioChannel2 = await client.channels.fetch(process.env.RADIO_CHANNEL_ID).catch(() => null);
       if (radioChannel2) await radioChannel2.send(`🔴 **${interaction.member.nickname || interaction.user.username}** ha finalizado servicio. Duración: **${formatDuration(duration)}**`);
       updateActivosMessage();
-
-      // Recordatorio de bitácora en 30 minutos
-      const bitacoraCount = data.history[userId].sessions.length;
+      const userHistoryNow = await getHistory(userId);
+      const bitacoraCount = userHistoryNow?.sessions.length || 0;
       setTimeout(async () => {
-        const freshData = loadData();
-        const sesionesActuales = freshData.history[userId]?.sessions.length || 0;
-        // Si no registró nueva bitácora (mismo conteo), mandar DM
-        if (sesionesActuales === bitacoraCount) {
-          try {
-            const user = await client.users.fetch(userId);
-            await user.send(`📋 Recuerda registrar tu **bitácora operativa** del turno que acabas de cerrar. Tienes pendiente el registro en el canal de bitácoras.`);
-          } catch {}
+        const freshHistory = await getHistory(userId);
+        if ((freshHistory?.sessions.length || 0) === bitacoraCount) {
+          try { const user = await client.users.fetch(userId); await user.send(`📋 Recuerda registrar tu **bitácora operativa** del turno que acabas de cerrar.`); } catch {}
         }
       }, 90 * 60 * 1000);
       return interaction.reply({ content: `🔴 Turno finalizado. Duración: **${formatDuration(duration)}**`, ephemeral: true });
@@ -896,9 +897,9 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.customId === 'ver_horas_staff') {
       const member = await interaction.guild.members.fetch(userId);
       if (!member.roles.cache.has(process.env.STAFF_ROLE_ID)) return interaction.reply({ content: '❌ Solo Comandancia puede ver este resumen.', ephemeral: true });
-      const history = data.history;
-      if (Object.keys(history).length === 0) return interaction.reply({ content: 'No hay horas registradas.', ephemeral: true });
-      const lines = Object.values(history).sort((a, b) => b.totalMs - a.totalMs).map(u => `👤 **${u.username}** — ${formatDuration(u.totalMs)}`);
+      const history = await getAllHistory();
+      if (history.length === 0) return interaction.reply({ content: 'No hay horas registradas.', ephemeral: true });
+      const lines = history.sort((a, b) => b.totalMs - a.totalMs).map(u => `👤 **${u.username}** — ${formatDuration(u.totalMs)}`);
       const embed = new EmbedBuilder().setTitle('📊 Resumen de Horas - LSPD').setDescription(lines.join('\n')).setColor(0xffd700).setTimestamp();
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
@@ -908,9 +909,7 @@ client.on('interactionCreate', async (interaction) => {
       const rangoActual = getRangoActual(interaction.member);
       const nickParts = (interaction.member.nickname || interaction.user.username).split(' ');
       const apellido = nickParts[nickParts.length - 1];
-
-      // Tomar último turno del oficial
-      const userHistory = data.history[interaction.user.id];
+      const userHistory = await getHistory(interaction.user.id);
       const lastSession = userHistory?.sessions?.[userHistory.sessions.length - 1];
       const horaInicio = lastSession ? new Date(lastSession.start).toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' }) : '';
       const horaCierre = lastSession ? new Date(lastSession.end).toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' }) : '';
@@ -1045,14 +1044,15 @@ client.on('interactionCreate', async (interaction) => {
         const count = interaction.guild.members.cache.filter(m => m.roles.cache.has(r.id)).size;
         return count > 0 ? `${r.nombre}: **${count}**` : null;
       }).filter(Boolean).join('\n');
-      const totalHoras = Object.values(data.history).reduce((acc, u) => acc + u.totalMs, 0);
+      const allHistory2 = await getAllHistory();
+      const totalHoras2 = allHistory2.reduce((acc, u) => acc + u.totalMs, 0);
       const embed = new EmbedBuilder()
         .setTitle('📊 Estadísticas – LSPD UnderGroundRP')
         .setColor(0x1e90ff)
         .addFields(
           { name: '👮 Oficiales por Rango', value: porRango || 'Sin datos' },
-          { name: '⏱️ Horas Totales Acumuladas', value: formatDuration(totalHoras) },
-          { name: '📋 Turnos Registrados', value: `${Object.values(data.history).reduce((acc, u) => acc + u.sessions.length, 0)}` },
+          { name: '⏱️ Horas Totales Acumuladas', value: formatDuration(totalHoras2) },
+          { name: '📋 Turnos Registrados', value: `${allHistory2.reduce((acc, u) => acc + u.sessions.length, 0)}` },
         )
         .setTimestamp();
       return interaction.reply({ embeds: [embed], ephemeral: true });
@@ -1138,8 +1138,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.customId.startsWith('adjuntar_fotos_')) {      const bitacoraMessageId = interaction.customId.replace('adjuntar_fotos_', '');
-      data.pendingBitacora[userId] = { channelId: interaction.channelId, messageId: bitacoraMessageId };
-      saveData(data);
+      await setPending(userId, interaction.channelId, bitacoraMessageId);
       return interaction.reply({ content: '📸 Envía las fotos ahora. Escribe `listo` cuando termines.', ephemeral: true });
     }
   }
@@ -1153,8 +1152,7 @@ client.on('interactionCreate', async (interaction) => {
     const horario = interaction.fields.getTextInputValue('p_horario');
 
     // Guardar paso 1 temporalmente
-    data.pendingBitacora[`post_${interaction.user.id}`] = { nombre, origen, experiencia, motivo, horario };
-    saveData(data);
+    await setPending(`post_${interaction.user.id}`, 'postulacion', JSON.stringify({ nombre, origen, experiencia, motivo, horario }));
 
     await interaction.reply({
       content: '✅ Paso 1 completado. Presiona el botón para continuar con el paso 2.',
@@ -1168,7 +1166,8 @@ client.on('interactionCreate', async (interaction) => {
   // Modal postulación paso 2
   if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_postulacion_2_')) {
     const userId = interaction.customId.replace('modal_postulacion_2_', '');
-    const paso1 = data.pendingBitacora[`post_${userId}`];
+    const pendingDoc = await getPending(`post_${userId}`);
+    const paso1 = pendingDoc ? JSON.parse(pendingDoc.messageId) : null;
     if (!paso1) return interaction.reply({ content: '❌ No se encontró el paso 1. Vuelve a postular.', ephemeral: true });
 
     const microfono = interaction.fields.getTextInputValue('p_microfono');
@@ -1177,8 +1176,7 @@ client.on('interactionCreate', async (interaction) => {
     const orden = interaction.fields.getTextInputValue('p_orden');
     const extra = interaction.fields.getTextInputValue('p_extra');
 
-    delete data.pendingBitacora[`post_${userId}`];
-    saveData(data);
+    await deletePending(`post_${userId}`);
 
     const embed = new EmbedBuilder()
       .setTitle('📋 Nueva Postulación – LSPD UnderGroundRP')
@@ -1313,14 +1311,12 @@ client.on('interactionCreate', async (interaction) => {
 // ─── FOTOS ────────────────────────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-  const data = loadData();
   const userId = message.author.id;
-  const pending = data.pendingBitacora[userId];
+  const pending = await getPending(userId);
   if (!pending) return;
 
   if (message.content.toLowerCase() === 'listo') {
-    delete data.pendingBitacora[userId];
-    saveData(data);
+    await deletePending(userId);
     const reply = await message.reply('✅ Fotos adjuntadas a tu bitácora.');
     setTimeout(() => reply.delete().catch(() => {}), 5000);
     await message.delete().catch(() => {});
@@ -1335,13 +1331,9 @@ client.on('messageCreate', async (message) => {
       const photoLinks = attachments.map((a, i) => `[Foto ${i + 1}](${a.url})`).join(' | ');
       const updatedEmbed = EmbedBuilder.from(bitacoraMsg.embeds[0]).addFields({ name: '📸 Fotos de Detenidos', value: photoLinks });
       await bitacoraMsg.edit({ embeds: [updatedEmbed] });
-
       const archivoChannel = await client.channels.fetch(process.env.ARCHIVO_CHANNEL_ID).catch(() => null);
       if (archivoChannel) {
-        await archivoChannel.send({
-          content: `📸 **Fotos de detenidos** — bitácora de <@${message.author.id}>`,
-          files: attachments.map(a => a.url),
-        });
+        await archivoChannel.send({ content: `📸 **Fotos de detenidos** — bitácora de <@${message.author.id}>`, files: attachments.map(a => a.url) });
       }
       await message.delete().catch(() => {});
     } catch (e) {
@@ -1352,15 +1344,11 @@ client.on('messageCreate', async (message) => {
 
 // ─── CERRAR TURNO AL SALIR DEL SERVIDOR ──────────────────────────────────────
 client.on('guildMemberRemove', async (member) => {
-  const data = loadData();
-  const session = data.sessions[member.id];
+  const session = await getSession(member.id);
   if (!session) return;
   const duration = Date.now() - session.start;
-  if (!data.history[member.id]) data.history[member.id] = { username: member.user.tag, totalMs: 0, sessions: [] };
-  data.history[member.id].totalMs += duration;
-  data.history[member.id].sessions.push({ start: session.start, end: Date.now(), duration });
-  delete data.sessions[member.id];
-  saveData(data);
+  await addSessionToHistory(member.id, member.user.tag, session.start, Date.now(), duration);
+  await deleteSession(member.id);
   console.log(`Turno cerrado automáticamente para ${member.user.tag} (salió del servidor).`);
   const radioChannel = await client.channels.fetch(process.env.RADIO_CHANNEL_ID).catch(() => null);
   if (radioChannel) await radioChannel.send(`🔴 **${member.nickname || member.user.username}** ha salido del servidor. Turno cerrado automáticamente. Duración: **${formatDuration(duration)}**`);
